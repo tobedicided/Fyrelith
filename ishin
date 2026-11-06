@@ -1,0 +1,244 @@
+-- Ishin reactive defense. F8 toggles; run again to replace the previous copy.
+local env = getgenv()
+if env.IshinAutoDefense then env.IshinAutoDefense.stop() end
+local tryBlock = filtergc('function', {Name='TryBlock', Constants={'Weave'}}, true)
+assert(tryBlock, 'Combat controller unavailable')
+local registry = debug.getupvalue(tryBlock, 5)
+local remote = debug.getupvalue(tryBlock, 8)
+local replica = registry:get('player-state-replica')
+local getTick = registry:get('GetTick')
+local player = game:GetService('Players').LocalPlayer
+local run = game:GetService('RunService')
+local input = game:GetService('UserInputService')
+local activeTouches = {}
+local touchStarted = input.TouchStarted:Connect(function(touch) activeTouches[touch] = true end)
+local touchEnded = input.TouchEnded:Connect(function(touch) activeTouches[touch] = nil end)
+local combatInputLoop
+for _, f in filtergc('function', {Constants={'M1','BlockStop'}}, false) do
+    if debug.getupvalue(f,3) == tryBlock and type(debug.getupvalue(f,19)) == 'boolean' then combatInputLoop = f break end
+end
+local pausedAttack = false
+local pausedTouches = {}
+local function pauseAttack()
+    if combatInputLoop then
+        if debug.getupvalue(combatInputLoop,19) then
+            if not pausedAttack then
+                pausedTouches = {}
+                for touch in activeTouches do pausedTouches[#pausedTouches+1] = touch end
+            end
+            pausedAttack = true
+        end
+        debug.setupvalue(combatInputLoop,19,false)
+    end
+end
+local function resumeAttack()
+    local touchStillHeld = #pausedTouches > 0
+    for _, touch in pausedTouches do if not activeTouches[touch] then touchStillHeld = false break end end
+    if combatInputLoop and pausedAttack and (input:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) or touchStillHeld) then
+        debug.setupvalue(combatInputLoop,19,true)
+    end
+    pausedAttack = false
+    pausedTouches = {}
+end
+local attacks = {}
+for _, anim in registry:get('ReplicatedAssetsAnimations').Combat.Styles:QueryDescendants('Animation') do
+    local name = anim.Name:lower()
+    -- A grapple's User/Target clips play after contact; defend its Start clip.
+    if name:find('critical') and (name:find('target') or (name:match('user$') and anim.Parent:FindFirstChild((anim.Name:gsub('User$', 'Start'))))) then continue end
+    if name:find('punch') or name:find('critical') or name:find('kick') or name:find('heavy') then
+        attacks[anim.AnimationId] = {name=anim.Name, critical=name:find('critical') ~= nil or name:find('heavy') ~= nil}
+    end
+end
+local state = {enabled=true, attempts=0, weaves=0, blocks=0, errors=0, connections={}, timingOffset=0, punchTime=0.17, criticalTime=0.03, blockAcknowledged=0, blockRetries=0, version=9, recentBlocks={}, faceThreat=true, turns=0, threats=0, targetSwitches=0, attackPauseAvailable=combatInputLoop~=nil, dashDetections=0, touchControls=true}
+env.IshinAutoDefense = state
+table.insert(state.connections,touchStarted)
+table.insert(state.connections,touchEnded)
+local gui = Instance.new('ScreenGui')
+gui.Name = 'IshinAutoDefense'
+gui.ResetOnSpawn = false
+gui.Parent = player:WaitForChild('PlayerGui')
+local button = Instance.new('TextButton')
+button.Size = UDim2.fromOffset(320, 48)
+button.Position = UDim2.new(0, 12, 0.22, 0)
+button.BackgroundColor3 = Color3.fromRGB(25, 30, 38)
+button.TextColor3 = Color3.fromRGB(110, 245, 170)
+button.TextSize = 16
+button.Parent = gui
+local widthLimit = Instance.new('UISizeConstraint')
+widthLimit.MaxSize = Vector2.new(395,48)
+widthLimit.Parent = button
+local earlier = Instance.new('TextButton')
+earlier.Name = 'Earlier'
+earlier.Size = UDim2.new(0.49,0,0,48)
+earlier.Position = UDim2.new(0,0,1,6)
+earlier.Text = 'Earlier -10 ms'
+earlier.BackgroundColor3 = Color3.fromRGB(35,42,54)
+earlier.TextColor3 = Color3.new(1,1,1)
+earlier.TextSize = 16
+earlier.Parent = button
+local later = earlier:Clone()
+later.Name = 'Later'
+later.Position = UDim2.new(0.51,0,1,6)
+later.Text = 'Later +10 ms'
+later.Parent = button
+local function resizeControls()
+    local camera = workspace.CurrentCamera
+    local width = camera and camera.ViewportSize.X or 344
+    button.Size = UDim2.fromOffset(math.min(395, math.max(180,width-24)),48)
+end
+resizeControls()
+if workspace.CurrentCamera then table.insert(state.connections,workspace.CurrentCamera:GetPropertyChangedSignal('ViewportSize'):Connect(resizeControls)) end
+local function refresh()
+    button.Text = string.format('Auto defense: %s | Tap to toggle | %dms', state.enabled and 'ON' or 'OFF', math.floor((state.punchTime+state.timingOffset)*1000+0.5))
+end
+local releaseAt, nextAction, nextScan = 0, 0, 0
+local pendingBlock, acknowledged, nextBlockSend = false, false, 0
+local facingTarget, facingHumanoid, originalAutoRotate
+local function restoreFacing()
+    if facingHumanoid and facingHumanoid.Parent then facingHumanoid.AutoRotate = originalAutoRotate end
+    facingTarget, facingHumanoid, originalAutoRotate = nil, nil, nil
+end
+local function faceThreat(root, humanoid, target)
+    if not state.faceThreat or not target or not target.Parent then return end
+    local direction = target.Position - root.Position
+    direction = Vector3.new(direction.X, 0, direction.Z)
+    if direction.Magnitude < 0.05 then return end
+    if facingHumanoid ~= humanoid then
+        restoreFacing()
+        facingHumanoid, originalAutoRotate = humanoid, humanoid.AutoRotate
+    end
+    facingTarget = target
+    humanoid.AutoRotate = false
+    root.CFrame = CFrame.lookAt(root.Position, root.Position + direction)
+end
+local targets = {}
+local seen = setmetatable({}, {__mode='k'})
+local function release()
+    if releaseAt > 0 then pcall(function() remote:FireServer('BlockStop') end) end
+    releaseAt = 0
+    pendingBlock = false
+    restoreFacing()
+    resumeAttack()
+end
+local function toggle()
+    state.enabled = not state.enabled
+    if not state.enabled then release() end
+    refresh()
+end
+state.stop = function()
+    state.enabled = false
+    release()
+    for _, c in state.connections do c:Disconnect() end
+    gui:Destroy()
+end
+table.insert(state.connections, button.Activated:Connect(toggle))
+table.insert(state.connections,earlier.Activated:Connect(function() state.timingOffset=math.max(-0.12,state.timingOffset-0.01) refresh() end))
+table.insert(state.connections,later.Activated:Connect(function() state.timingOffset=math.min(0.20,state.timingOffset+0.01) refresh() end))
+table.insert(state.connections, input.InputBegan:Connect(function(key, consumed)
+    if consumed then return end
+    if key.KeyCode == Enum.KeyCode.F8 then toggle()
+    elseif key.KeyCode == Enum.KeyCode.F6 then state.timingOffset = math.max(-0.12, state.timingOffset-0.01) refresh()
+    elseif key.KeyCode == Enum.KeyCode.F7 then state.timingOffset = math.min(0.20, state.timingOffset+0.01) refresh() end
+end))
+table.insert(state.connections, run.Heartbeat:Connect(function()
+    local now = os.clock()
+    if pendingBlock and not acknowledged and replica.Data.IsBlocking then
+        acknowledged = true
+        state.blockAcknowledged += 1
+        if state.recentBlocks[#state.recentBlocks] then state.recentBlocks[#state.recentBlocks].acknowledged = true end
+    end
+    if releaseAt > 0 and now >= releaseAt then release() end
+    if not state.enabled then return end
+    local char = player.Character
+    local root = char and char:FindFirstChild('HumanoidRootPart')
+    local ownHum = char and char:FindFirstChildOfClass('Humanoid')
+    if not root or not ownHum or ownHum.Health <= 0 then release() return end
+    if releaseAt > now then pauseAttack() end
+    if releaseAt > now and facingTarget then faceThreat(root, ownHum, facingTarget) end
+    -- Match the game's held-block input loop; one request can be lost to
+    -- startup cooldown, stun, or action lock.
+    if pendingBlock and releaseAt > now and now >= nextBlockSend then
+        nextBlockSend = now + 0.05
+        local ok, err = pcall(tryBlock, false)
+        state.blockRetries += 1
+        if not ok then state.errors += 1 state.lastError = tostring(err) end
+    end
+    if now >= nextScan then
+        nextScan = now + 0.10
+        targets = {}
+        for _, hum in workspace:QueryDescendants('Humanoid') do
+            local model = hum.Parent
+            local part = model:FindFirstChild('HumanoidRootPart')
+            local animator = hum:FindFirstChildOfClass('Animator')
+            if model ~= char and part and animator and hum.Health > 0 and (part.Position-root.Position).Magnitude <= 40 then
+                targets[#targets+1] = {part=part, animator=animator}
+            end
+        end
+    end
+    local data, tick = replica.Data, getTick()
+    local ownAttackBusy = tick < (data.M1LockUntil or 0) or data.ActionLock == true
+    local candidates, nearbyAttackers = {}, {}
+    -- Inspect every attacker before choosing; action throttling must never
+    -- prevent discovery of another opponent's heavy startup.
+    for _, target in targets do
+        if target.part.Parent then
+            local offset = root.Position-target.part.Position
+            local distance = offset.Magnitude
+            local closing = distance > 0.1 and (target.part.AssemblyLinearVelocity-root.AssemblyLinearVelocity):Dot(offset.Unit) or 0
+            local approaching = closing > 6 and distance <= 30 and (distance-10.5)/closing <= 0.22
+            if (distance <= 10.5 or approaching) and (distance < 1 or target.part.CFrame.LookVector:Dot(offset.Unit) > 0.1) then
+                for _, track in target.animator:GetPlayingAnimationTracks() do
+                    local attack = attacks[track.Animation.AnimationId]
+                    local position = track.TimePosition
+                    local previous = seen[track]
+                    if previous and position + 0.03 < previous.position then seen[track] = nil previous = nil end
+                    if previous then previous.position = position end
+                    if attack and track.IsPlaying and track.Speed > 0 and track.WeightCurrent > 0.1 and position < (attack.critical and 1.0 or 0.50) then
+                        nearbyAttackers[target.part] = true
+                    end
+                    if attack and not previous and track.IsPlaying and track.Speed > 0 and track.WeightCurrent > 0.1 then
+                        local trigger = (attack.critical and state.criticalTime or (ownAttackBusy and 0.10 or state.punchTime)) + state.timingOffset * track.Speed
+                        local latest = attack.critical and math.min(track.Length,0.75) or trigger + 0.09 * track.Speed
+                        if position > latest then continue end
+                        if position >= trigger then
+                            candidates[#candidates+1] = {target=target.part, track=track, attack=attack, position=position, approaching=approaching, score=(attack.critical and 100 or 0)+(position-trigger)/track.Speed*100-distance}
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local count = 0
+    for _ in nearbyAttackers do count += 1 end
+    state.threats = count
+    if #candidates == 0 or now < nextAction then return end
+    table.sort(candidates, function(a,b) return a.score>b.score end)
+    local chosen = candidates[1]
+    if chosen.approaching then state.dashDetections += 1 end
+    local running = ownHum.MoveDirection.Magnitude > 0.1 and root.AssemblyLinearVelocity.Magnitude > 8
+    local attacking = tick < (data.M1LockUntil or 0) or tick < (data.M1CooldownUntil or 0) or data.ActionLock == true
+    local weave = not chosen.attack.critical and count == 1 and not running and not attacking and not pendingBlock and not data.IsBlocking and data.StanceHasWeave and tick >= (data.WeaveCooldownUntil or 0)
+    state.running, state.attacking = running, attacking
+    if facingTarget and facingTarget ~= chosen.target then state.targetSwitches += 1 end
+    faceThreat(root, ownHum, chosen.target)
+    state.turns += 1
+    pauseAttack()
+    local ok, err = pcall(tryBlock, weave == true)
+    nextAction = now + 0.05
+    if not ok then state.errors += 1 state.lastError = tostring(err) restoreFacing() resumeAttack() return end
+    seen[chosen.track] = {position=chosen.position}
+    state.attempts += 1
+    if weave then state.weaves += 1 else state.blocks += 1 end
+    state.lastAttack, state.lastTriggerPosition = chosen.attack.name, chosen.position
+    state.lastMode, state.lastTarget = weave and 'Weave' or 'Block', chosen.target.Parent.Name
+    releaseAt = math.max(releaseAt, now + (chosen.attack.critical and 0.90 or (weave and 0.14 or 0.35)))
+    if not weave then
+        if not pendingBlock then acknowledged = false end
+        pendingBlock = true
+        nextBlockSend = now + 0.05
+        state.recentBlocks[#state.recentBlocks+1] = {attack=chosen.attack.name,position=chosen.position,acknowledged=data.IsBlocking==true,stunned=(data.FullStun or 0)>tick or (data.SoftStun or 0)>tick,actionLock=data.ActionLock,health=ownHum.Health,running=running,attacking=attacking,threats=count,approaching=chosen.approaching}
+        if #state.recentBlocks>8 then table.remove(state.recentBlocks,1) end
+    end
+    refresh()
+end))
+refresh()
