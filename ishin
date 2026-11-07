@@ -1,12 +1,85 @@
 -- Ishin reactive defense. F8 toggles; run again to replace the previous copy.
 local env = getgenv()
+local previousDefense=env.IshinAutoDefense
+-- Contact phases observed in this session, in animation seconds rather than
+-- wall time. These remain estimates; server-only hitbox timing is unavailable.
+local nativeContacts=previousDefense and previousDefense.nativeContacts or {
+    DefaultPunch1={0.47956,0.47956},DefaultPunch2={0.46458,0.49455},
+    DefaultPunch3={0.46458,0.43460},DefaultPunch4={0.49455},
+    KendoPunch1={0.42120,0.46800,0.49920},KendoPunch2={0.47621},
+    KendoPunch3={0.34484,0.50906},KendoPunch4={0.41053},
+    DumbKendoCritical={0.45528,0.47154,0.48780},
+    AikidoPunch1={0.58021,0.54797,0.51574,0.54797},
+    AikidoPunch2={0.41904,0.49962,0.51574,0.41904},
+    AikidoPunch3={0.56409,0.49962,0.46739},
+    AikidoPunch4={0.54797,0.49962,0.48351},
+}
+local phaseCache={}
+local function contactPhase(name)
+    if phaseCache[name]~=nil then return phaseCache[name] or nil end
+    local samples=nativeContacts[name]
+    if not samples or #samples==0 then
+        local family=name:gsub('%d+$','')
+        local combined={}
+        for key,values in nativeContacts do
+            if key:gsub('%d+$','')==family then for _,value in values do combined[#combined+1]=value end end
+        end
+        if #combined>=2 then samples=combined end
+    end
+    if not samples or #samples==0 then phaseCache[name]=false return nil end
+    local sorted=table.clone(samples)
+    table.sort(sorted)
+    local middle=math.floor((#sorted+1)/2)
+    phaseCache[name]=#sorted%2==0 and (sorted[middle]+sorted[middle+1])/2 or sorted[middle]
+    return phaseCache[name]
+end
+local function recordContact(event)
+    if event.sampleGap and event.sampleGap>0.12 then return end
+    if #(event.attacks or {})~=1 then return end
+    local a=event.attacks[1]
+    if a.name=='AikidoCriticalStart' or a.time<0.22 or a.time>0.85 then return end
+    local old=contactPhase(a.name)
+    if old and math.abs(a.time-old)>0.18 then return end
+    local samples=nativeContacts[a.name] or {}
+    nativeContacts[a.name]=samples
+    samples[#samples+1]=a.time
+    if #samples>7 then table.remove(samples,1) end
+    table.clear(phaseCache)
+end
 if env.IshinAutoDefense then env.IshinAutoDefense.stop() end
 local tryBlock = filtergc('function', {Name='TryBlock', Constants={'Weave'}}, true)
 assert(tryBlock, 'Combat controller unavailable')
 local registry = debug.getupvalue(tryBlock, 5)
 local remote = debug.getupvalue(tryBlock, 8)
+local nativePress
+for _,f in filtergc('function',{Constants={'WheelchairPushing','ButtonL2'}},false) do
+    if debug.getupvalue(f,7)==tryBlock then nativePress=f break end
+end
+local nativeRelease
+for _,f in filtergc('function',{Constants={'BlockStop'}},false) do
+    local u=debug.getupvalues(f)
+    if #u==5 and u[5]==remote and type(u[1])=='boolean' and type(u[2])=='boolean' then nativeRelease=f break end
+end
+assert(nativePress and nativeRelease,'Native block input unavailable; refusing partial defense')
 local replica = registry:get('player-state-replica')
 local getTick = registry:get('GetTick')
+local abortDash=debug.getupvalue(tryBlock,6)
+local tryRun=filtergc('function',{Name='TryRun',Constants={'IsRunning','OnRunChanged'}},true)
+local runState=tryRun and debug.getupvalue(tryRun,7)
+local runSignals=tryRun and debug.getupvalue(tryRun,8)
+local sprintPaused=false
+local function prepareGuardMovement()
+    if type(abortDash)=='function' then pcall(abortDash) end
+    if tryRun then
+        runState=debug.getupvalue(tryRun,7)
+        runSignals=debug.getupvalue(tryRun,8)
+    end
+    if type(runState)=='table' and runState.IsRunning and type(runSignals)=='table' and runSignals.OnRunChanged then
+        sprintPaused=true
+        runState.IsRunning=false
+        pcall(function() runSignals.OnRunChanged:Fire(false) end)
+    end
+end
 local player = game:GetService('Players').LocalPlayer
 local run = game:GetService('RunService')
 local input = game:GetService('UserInputService')
@@ -49,8 +122,29 @@ for _, anim in registry:get('ReplicatedAssetsAnimations').Combat.Styles:QueryDes
         attacks[anim.AnimationId] = {name=anim.Name, critical=name:find('critical') ~= nil or name:find('heavy') ~= nil}
     end
 end
-local state = {enabled=true, attempts=0, weaves=0, blocks=0, errors=0, connections={}, timingOffset=0, punchTime=0.17, criticalTime=0.03, blockAcknowledged=0, blockRetries=0, version=9, recentBlocks={}, faceThreat=true, turns=0, threats=0, targetSwitches=0, attackPauseAvailable=combatInputLoop~=nil, dashDetections=0, touchControls=true}
+local state = {enabled=true, attempts=0, weaves=0, blocks=0, errors=0, connections={}, timingOffset=0, punchTime=0.30, criticalTime=0.32, blockAcknowledged=0, version=22, recentBlocks={}, faceThreat=true, turns=0, threats=0, targetSwitches=0, attackPauseAvailable=combatInputLoop~=nil, dashDetections=0, touchControls=true, damageEvents={}, stanceRequests=0, shortGuard=true, normalGuardTime=0.18, heavyGuardTime=0.22, guardGap=0.015, preparations=0,trackConnections={},playerConnections={}}
 env.IshinAutoDefense = state
+state.autoTimingLearning='single-attacker contact phase'
+state.nativeInput=true
+state.weaveAcknowledged=0
+state.recentActions={}
+state.nativeContacts=nativeContacts
+state.history=previousDefense and previousDefense.history or {}
+if previousDefense and previousDefense.stats and previousDefense.stats.requests>0 then
+    state.history[#state.history+1]=previousDefense.stats
+    if #state.history>8 then table.remove(state.history,1) end
+end
+state.stats={requests=0,accepted=0,invulnerabilityConfirmed=0,criticalRequests=0,criticalAccepted=0,criticalInvulnerabilityConfirmed=0,runningRequests=0,runningAccepted=0,damageEvents=0,blockingDamageEvents=0,unblockedDamageEvents=0,criticalDamageEvents=0,totalDamage=0,deaths=0}
+state.replicaId=replica.Id
+state.replicaRefreshes=0
+state.version=23
+state.version=24
+state.version=25
+state.antiStun=previousDefense and previousDefense.antiStun~=false or previousDefense==nil
+state.antiStunFrames=0
+state.autoSprint=previousDefense and previousDefense.autoSprint~=false or previousDefense==nil
+state.infiniteStamina=previousDefense and previousDefense.infiniteStamina~=false or previousDefense==nil
+state.sprintStarts,state.staminaWrites=0,0
 table.insert(state.connections,touchStarted)
 table.insert(state.connections,touchEnded)
 local gui = Instance.new('ScreenGui')
@@ -58,38 +152,56 @@ gui.Name = 'IshinAutoDefense'
 gui.ResetOnSpawn = false
 gui.Parent = player:WaitForChild('PlayerGui')
 local button = Instance.new('TextButton')
-button.Size = UDim2.fromOffset(320, 48)
-button.Position = UDim2.new(0, 12, 0.22, 0)
+button.Size = UDim2.fromOffset(184, 36)
+button.Position = UDim2.new(0, 8, 0.20, 0)
 button.BackgroundColor3 = Color3.fromRGB(25, 30, 38)
 button.TextColor3 = Color3.fromRGB(110, 245, 170)
-button.TextSize = 16
+button.TextSize = 13
 button.Parent = gui
 local widthLimit = Instance.new('UISizeConstraint')
-widthLimit.MaxSize = Vector2.new(395,48)
+widthLimit.MaxSize = Vector2.new(220,40)
 widthLimit.Parent = button
 local earlier = Instance.new('TextButton')
 earlier.Name = 'Earlier'
-earlier.Size = UDim2.new(0.49,0,0,48)
-earlier.Position = UDim2.new(0,0,1,6)
-earlier.Text = 'Earlier -10 ms'
+earlier.Size = UDim2.new(0.49,0,0,34)
+earlier.Position = UDim2.new(0,0,1,3)
+earlier.Text = '-10 ms'
 earlier.BackgroundColor3 = Color3.fromRGB(35,42,54)
 earlier.TextColor3 = Color3.new(1,1,1)
-earlier.TextSize = 16
+earlier.TextSize = 13
 earlier.Parent = button
 local later = earlier:Clone()
 later.Name = 'Later'
-later.Position = UDim2.new(0.51,0,1,6)
-later.Text = 'Later +10 ms'
+later.Position = UDim2.new(0.51,0,1,3)
+later.Text = '+10 ms'
 later.Parent = button
+local runButton=earlier:Clone()
+runButton.Name='AutoSprint'
+runButton.Size=UDim2.new(0.49,0,0,28)
+runButton.Position=UDim2.new(0,0,1,40)
+runButton.Parent=button
+local staminaButton=runButton:Clone()
+staminaButton.Name='InfiniteStamina'
+staminaButton.Position=UDim2.new(0.51,0,1,40)
+staminaButton.Parent=button
+local antiButton=runButton:Clone()
+antiButton.Name='AntiStun'
+antiButton.Size=UDim2.new(1,0,0,28)
+antiButton.Position=UDim2.new(0,0,1,71)
+antiButton.Parent=button
 local function resizeControls()
     local camera = workspace.CurrentCamera
     local width = camera and camera.ViewportSize.X or 344
-    button.Size = UDim2.fromOffset(math.min(395, math.max(180,width-24)),48)
+    button.Size = UDim2.fromOffset(math.min(184,math.max(120,math.floor(width*0.42)),width-16),36)
 end
 resizeControls()
 if workspace.CurrentCamera then table.insert(state.connections,workspace.CurrentCamera:GetPropertyChangedSignal('ViewportSize'):Connect(resizeControls)) end
 local function refresh()
-    button.Text = string.format('Auto defense: %s | Tap to toggle | %dms', state.enabled and 'ON' or 'OFF', math.floor((state.punchTime+state.timingOffset)*1000+0.5))
+    local status=state.enabled and (state.unavailable and (state.unavailableReason or 'NO GUARD') or 'ON') or 'OFF'
+    button.Text = string.format('Defense %s | %s',status,state.lastDelay and string.format('%dms',math.floor(state.lastDelay*1000+0.5)) or 'Auto timing')
+    runButton.Text='Run '..(state.autoSprint and 'ON' or 'OFF')
+    staminaButton.Text='Stam '..(state.infiniteStamina and 'ON' or 'OFF')
+    antiButton.Text='Anti-stun '..(state.antiStun and 'ON' or 'OFF')
 end
 local releaseAt, nextAction, nextScan = 0, 0, 0
 local pendingBlock, acknowledged, nextBlockSend = false, false, 0
@@ -109,16 +221,53 @@ local function faceThreat(root, humanoid, target)
     end
     facingTarget = target
     humanoid.AutoRotate = false
-    root.CFrame = CFrame.lookAt(root.Position, root.Position + direction)
+    if root.CFrame.LookVector:Dot(direction.Unit)<0.9848 then
+        root.CFrame = CFrame.lookAt(root.Position, root.Position + direction)
+    end
 end
 local targets = {}
+local trackedModels=setmetatable({},{__mode='k'})
+for _,humanoid in workspace:QueryDescendants('Humanoid') do trackedModels[humanoid.Parent]=true end
+table.insert(state.connections,workspace.DescendantAdded:Connect(function(instance)
+    if instance:IsA('Humanoid') and instance.Parent then trackedModels[instance.Parent]=true end
+end))
+table.insert(state.connections,workspace.DescendantRemoving:Connect(function(instance)
+    if instance:IsA('Humanoid') and instance.Parent then trackedModels[instance.Parent]=nil end
+end))
 local seen = setmetatable({}, {__mode='k'})
-local function release()
-    if releaseAt > 0 then pcall(function() remote:FireServer('BlockStop') end) end
+local monitored = setmetatable({}, {__mode='k'})
+local lastHealth, lastMaxHealth, lastCharacter = nil, nil, nil
+local lastHealthAt=0
+local deathCharacter
+local nextStanceRequest = 0
+local preparingUntil = 0
+local currentRequest
+local restoreAttackHook
+local autoStartedRun=false
+local clearAntiStun
+local antiSource
+local function serverStunUntil(key,data)
+    if antiSource and antiSource.replica==replica then return antiSource.values[key] or 0 end
+    return data[key] or 0
+end
+local function markAccepted(mode)
+    if not currentRequest then return end
+    currentRequest[mode]=true
+    if not currentRequest.accepted then
+        currentRequest.accepted=true
+        state.stats.accepted+=1
+        if currentRequest.critical then state.stats.criticalAccepted+=1 end
+        if currentRequest.running then state.stats.runningAccepted+=1 end
+    end
+end
+local function release(resumeAllowed)
+    if releaseAt > 0 then pcall(nativeRelease,nil,nil,nil) end
+    nextAction=math.max(nextAction,os.clock()+state.guardGap)
     releaseAt = 0
     pendingBlock = false
+    preparingUntil = 0
     restoreFacing()
-    resumeAttack()
+    if resumeAllowed==false then pausedAttack=false pausedTouches={} else resumeAttack() end
 end
 local function toggle()
     state.enabled = not state.enabled
@@ -128,10 +277,57 @@ end
 state.stop = function()
     state.enabled = false
     release()
+    if clearAntiStun then clearAntiStun() end
+    if autoStartedRun and tryRun then
+        local rs=debug.getupvalue(tryRun,7)
+        local signals=debug.getupvalue(tryRun,8)
+        if type(rs)=='table' and rs.IsRunning and type(signals)=='table' and signals.OnRunChanged then
+            rs.IsRunning=false
+            pcall(function() signals.OnRunChanged:Fire(false) end)
+        end
+    end
+    if restoreAttackHook then pcall(restoreAttackHook) end
     for _, c in state.connections do c:Disconnect() end
+    for _,c in state.trackConnections do c:Disconnect() end
+    for _,connections in state.playerConnections do for _,c in connections do c:Disconnect() end end
+    for _,entry in state.esp or {} do
+        entry.highlight:Destroy()
+        entry.billboard:Destroy()
+    end
     gui:Destroy()
 end
+state.bufferedAttacks=0
+state.attackGateAvailable=false
+if type(hookfunction)=='function' then
+    for _,f in filtergc('function',{Constants={'M1','Dodge'}},false) do
+        local u=debug.getupvalues(f)
+        if #u==3 and u[3]==remote and type(u[1])=='boolean' then
+            local gate={}
+            gate.handle=function(...)
+                local now=os.clock()
+                if state.enabled and (releaseAt>now or preparingUntil>now) then
+                    pausedAttack=true
+                    pausedTouches={}
+                    for touch in activeTouches do pausedTouches[#pausedTouches+1]=touch end
+                    state.bufferedAttacks+=1
+                    return
+                end
+                return gate.original(...)
+            end
+            local ok,original=pcall(hookfunction,f,function(...) return gate.handle(...) end)
+            if ok then
+                gate.original=original
+                restoreAttackHook=function() hookfunction(f,original) end
+                state.attackGateAvailable=true
+            else state.attackGateError=tostring(original) end
+            break
+        end
+    end
+end
 table.insert(state.connections, button.Activated:Connect(toggle))
+table.insert(state.connections,runButton.Activated:Connect(function() state.autoSprint=not state.autoSprint refresh() end))
+table.insert(state.connections,staminaButton.Activated:Connect(function() state.infiniteStamina=not state.infiniteStamina refresh() end))
+table.insert(state.connections,antiButton.Activated:Connect(function() state.antiStun=not state.antiStun refresh() end))
 table.insert(state.connections,earlier.Activated:Connect(function() state.timingOffset=math.max(-0.12,state.timingOffset-0.01) refresh() end))
 table.insert(state.connections,later.Activated:Connect(function() state.timingOffset=math.min(0.20,state.timingOffset+0.01) refresh() end))
 table.insert(state.connections, input.InputBegan:Connect(function(key, consumed)
@@ -140,44 +336,127 @@ table.insert(state.connections, input.InputBegan:Connect(function(key, consumed)
     elseif key.KeyCode == Enum.KeyCode.F6 then state.timingOffset = math.max(-0.12, state.timingOffset-0.01) refresh()
     elseif key.KeyCode == Enum.KeyCode.F7 then state.timingOffset = math.min(0.20, state.timingOffset+0.01) refresh() end
 end))
-table.insert(state.connections, run.Heartbeat:Connect(function()
+local function updateDefense()
     local now = os.clock()
+    local latestReplica=registry:get('player-state-replica')
+    if not latestReplica or type(latestReplica.Data)~='table' then
+        release(false)
+        lastHealth,lastMaxHealth=nil,nil
+        currentRequest=nil
+        if state.unavailableReason~='LOADING' then state.unavailable=true state.unavailableReason='LOADING' refresh() end
+        return
+    end
+    if latestReplica and latestReplica~=replica then
+        release(false)
+        replica=latestReplica
+        currentRequest=nil
+        lastHealth,lastMaxHealth,lastCharacter=nil,nil,nil
+        lastHealthAt=0
+        nextScan,nextStanceRequest=0,0
+        sprintPaused=false
+        for _,f in filtergc('function',{Name='TryRun',Constants={'IsRunning','OnRunChanged'}},false) do
+            if debug.getupvalue(f,1)==replica then tryRun=f break end
+        end
+        state.replicaId=replica.Id
+        state.replicaRefreshes+=1
+    end
+    if currentRequest and not currentRequest.invulnerabilityConfirmed and (replica.Data.WeaveState or 0)>currentRequest.oldWeaveState and (replica.Data.WeaveState or 0)>currentRequest.serverTime then
+        currentRequest.invulnerabilityConfirmed=true
+        state.stats.invulnerabilityConfirmed+=1
+        if currentRequest.critical then state.stats.criticalInvulnerabilityConfirmed+=1 end
+    end
+    if currentRequest and not currentRequest.weaveAccepted then
+        local d=replica.Data
+        if ((d.WeaveWindow or 0)>currentRequest.oldWeaveWindow and (d.WeaveWindow or 0)>currentRequest.serverTime) or ((d.WeaveState or 0)>currentRequest.oldWeaveState and (d.WeaveState or 0)>currentRequest.serverTime) then
+            markAccepted('weaveAccepted')
+            state.weaveAcknowledged+=1
+            local remaining=math.max(d.WeaveWindow or 0,d.WeaveState or 0)-getTick()
+            if releaseAt>now then releaseAt=math.min(currentRequest.hardStop,math.max(releaseAt,now+math.max(0,remaining))) end
+        end
+    end
     if pendingBlock and not acknowledged and replica.Data.IsBlocking then
         acknowledged = true
         state.blockAcknowledged += 1
+        markAccepted('guardAccepted')
+        if currentRequest and releaseAt>now then releaseAt=math.min(currentRequest.hardStop,math.max(releaseAt,now+0.10)) end
         if state.recentBlocks[#state.recentBlocks] then state.recentBlocks[#state.recentBlocks].acknowledged = true end
     end
     if releaseAt > 0 and now >= releaseAt then release() end
-    if not state.enabled then return end
+    if not state.enabled then lastHealth,lastMaxHealth=nil,nil return end
     local char = player.Character
     local root = char and char:FindFirstChild('HumanoidRootPart')
     local ownHum = char and char:FindFirstChildOfClass('Humanoid')
-    if not root or not ownHum or ownHum.Health <= 0 then release() return end
-    if releaseAt > now then pauseAttack() end
-    if releaseAt > now and facingTarget then faceThreat(root, ownHum, facingTarget) end
-    -- Match the game's held-block input loop; one request can be lost to
-    -- startup cooldown, stun, or action lock.
-    if pendingBlock and releaseAt > now and now >= nextBlockSend then
-        nextBlockSend = now + 0.05
-        local ok, err = pcall(tryBlock, false)
-        state.blockRetries += 1
-        if not ok then state.errors += 1 state.lastError = tostring(err) end
+    if not root or not ownHum or ownHum.Health<=0 then
+        if ownHum and ownHum.Health<=0 and deathCharacter~=char then
+            deathCharacter=char
+            state.stats.deaths+=1
+            if lastHealth and lastHealth>0 then
+                state.stats.damageEvents+=1
+                state.stats.totalDamage+=lastHealth
+                if replica.Data.IsBlocking then state.stats.blockingDamageEvents+=1 else state.stats.unblockedDamageEvents+=1 end
+            end
+        end
+        release(false)
+        lastHealth,lastMaxHealth=nil,nil
+        if state.unavailableReason~='RESPAWNING' then state.unavailable=true state.unavailableReason='RESPAWNING' refresh() end
+        return
     end
+    local expectedHealth=lastHealth
+    if lastMaxHealth and lastMaxHealth>0 and ownHum.MaxHealth~=lastMaxHealth and expectedHealth then expectedHealth=expectedHealth*ownHum.MaxHealth/lastMaxHealth end
+    if char~=lastCharacter then
+        lastCharacter,lastHealth=char,ownHum.Health
+    elseif expectedHealth and ownHum.Health<expectedHealth-0.1 then
+        state.damageEvents[#state.damageEvents+1]={amount=expectedHealth-ownHum.Health,blocking=replica.Data.IsBlocking==true,stance=replica.Data.Stance,mode=state.lastMode,unknownTracks={},sampleGap=now-lastHealthAt}
+        local event=state.damageEvents[#state.damageEvents]
+        event.attacks={}
+        for _,target in targets do
+            if target.part.Parent and (target.part.Position-root.Position).Magnitude<12 then
+                for _,track in target.animator:GetPlayingAnimationTracks() do
+                    local attack=attacks[track.Animation.AnimationId]
+                    if attack and #event.attacks<3 then event.attacks[#event.attacks+1]={name=attack.name,time=track.TimePosition,speed=track.Speed} end
+                    if not attack and #event.unknownTracks<4 then event.unknownTracks[#event.unknownTracks+1]={id=track.Animation.AnimationId,time=track.TimePosition,owner=target.part.Parent.Name} end
+                end
+            end
+        end
+        recordContact(event)
+        state.stats.damageEvents+=1
+        state.stats.totalDamage+=event.amount
+        if event.blocking then state.stats.blockingDamageEvents+=1 else state.stats.unblockedDamageEvents+=1 end
+        if #event.attacks==1 and event.attacks[1].name:lower():find('critical') then state.stats.criticalDamageEvents+=1 end
+        if #state.damageEvents>8 then table.remove(state.damageEvents,1) end
+    end
+    lastHealth,lastMaxHealth=ownHum.Health,ownHum.MaxHealth
+    lastHealthAt=now
+    if releaseAt > now then pauseAttack() prepareGuardMovement() end
+    if releaseAt==0 and now>=preparingUntil and sprintPaused and not replica.Data.IsBlocking then
+        sprintPaused=false
+        if ownHum.MoveDirection.Magnitude>0.1 and tryRun then pcall(tryRun) end
+    end
+    if releaseAt > now and facingTarget then faceThreat(root, ownHum, facingTarget) end
+    -- The game's own held-input loop sends its retries and maintains local
+    -- flags. Do not run a second request loop alongside it.
     if now >= nextScan then
-        nextScan = now + 0.10
+        nextScan = now + 0.20
         targets = {}
-        for _, hum in workspace:QueryDescendants('Humanoid') do
-            local model = hum.Parent
-            local part = model:FindFirstChild('HumanoidRootPart')
-            local animator = hum:FindFirstChildOfClass('Animator')
-            if model ~= char and part and animator and hum.Health > 0 and (part.Position-root.Position).Magnitude <= 40 then
-                targets[#targets+1] = {part=part, animator=animator}
+        for model in trackedModels do
+            if model.Parent and model~=char then
+                local hum=model:FindFirstChildOfClass('Humanoid')
+                local part=model:FindFirstChild('HumanoidRootPart')
+                local animator=hum and hum:FindFirstChildOfClass('Animator')
+                if part and animator and hum.Health>0 then targets[#targets+1]={part=part,animator=animator} end
             end
         end
     end
     local data, tick = replica.Data, getTick()
-    local ownAttackBusy = tick < (data.M1LockUntil or 0) or data.ActionLock == true
+    local canDefend=data.InSafeZone~=true and (data.StanceHasBlock==true or data.StanceHasWeave==true)
+    local reason=data.InSafeZone==true and 'SAFE ZONE' or 'NO GUARD'
+    if state.unavailable~=(not canDefend) or state.unavailableReason~=reason then
+        state.unavailable=not canDefend
+        state.unavailableReason=reason
+        refresh()
+    end
     local candidates, nearbyAttackers = {}, {}
+    local preparationCandidate
     -- Inspect every attacker before choosing; action throttling must never
     -- prevent discovery of another opponent's heavy startup.
     for _, target in targets do
@@ -186,22 +465,53 @@ table.insert(state.connections, run.Heartbeat:Connect(function()
             local distance = offset.Magnitude
             local closing = distance > 0.1 and (target.part.AssemblyLinearVelocity-root.AssemblyLinearVelocity):Dot(offset.Unit) or 0
             local approaching = closing > 6 and distance <= 30 and (distance-10.5)/closing <= 0.22
-            if (distance <= 10.5 or approaching) and (distance < 1 or target.part.CFrame.LookVector:Dot(offset.Unit) > 0.1) then
+            if distance<=16 or approaching then
                 for _, track in target.animator:GetPlayingAnimationTracks() do
                     local attack = attacks[track.Animation.AnimationId]
+                    if attack and not attack.critical then
+                        if not (distance<=10.5 or approaching) then continue end
+                        if distance>=1 and target.part.CFrame.LookVector:Dot(offset.Unit)<=-0.1 then continue end
+                    end
+                    if attack and not monitored[track] then
+                        monitored[track]=true
+                        state.trackConnections[track]=track.Stopped:Connect(function()
+                            seen[track],monitored[track]=nil,nil
+                            local connection=state.trackConnections[track]
+                            state.trackConnections[track]=nil
+                            if connection then connection:Disconnect() end
+                        end)
+                    end
                     local position = track.TimePosition
                     local previous = seen[track]
                     if previous and position + 0.03 < previous.position then seen[track] = nil previous = nil end
                     if previous then previous.position = position end
-                    if attack and track.IsPlaying and track.Speed > 0 and track.WeightCurrent > 0.1 and position < (attack.critical and 1.0 or 0.50) then
+                    if attack and track.IsPlaying and track.Speed > 0 and position < (attack.critical and 1.0 or 0.50) then
                         nearbyAttackers[target.part] = true
                     end
-                    if attack and not previous and track.IsPlaying and track.Speed > 0 and track.WeightCurrent > 0.1 then
-                        local trigger = (attack.critical and state.criticalTime or (ownAttackBusy and 0.10 or state.punchTime)) + state.timingOffset * track.Speed
-                        local latest = attack.critical and math.min(track.Length,0.75) or trigger + 0.09 * track.Speed
+                    if attack and not previous and track.IsPlaying and track.Speed > 0 then
+                        -- Timings are real seconds, converted to animation time.
+                        -- Account for the outbound half of measured round-trip ping.
+                        local pingLead=math.clamp((tonumber(data.ReadPing) or 0)/2000,0,0.08)
+                        local delay=attack.critical and state.criticalTime or state.punchTime
+                        if attack.name=='AikidoCriticalStart' then delay=0 end
+                        local trigger=math.max(0,delay+state.timingOffset-pingLead)*track.Speed
+                        local phase=contactPhase(attack.name)
+                        if phase then
+                            local network=math.clamp((tonumber(data.ReadPing) or 0)/1000,0.02,0.18)
+                            trigger=math.max(0,phase-(network+0.055)*track.Speed+state.timingOffset*track.Speed)
+                        end
+                        if attack.name=='AikidoCriticalStart' then trigger=0 end
+                        local latest=math.min(track.Length,trigger+0.16*track.Speed)
+                        local untilGuard=(trigger-position)/track.Speed
+                        if untilGuard>0 and untilGuard<=0.45 then
+                            local score=(attack.critical and 100 or 0)-untilGuard*100-distance
+                            if not preparationCandidate or score>preparationCandidate.score then
+                                preparationCandidate={target=target.part,untilGuard=untilGuard,score=score,critical=attack.critical}
+                            end
+                        end
                         if position > latest then continue end
                         if position >= trigger then
-                            candidates[#candidates+1] = {target=target.part, track=track, attack=attack, position=position, approaching=approaching, score=(attack.critical and 100 or 0)+(position-trigger)/track.Speed*100-distance}
+                            candidates[#candidates+1] = {target=target.part, track=track, attack=attack, position=position, delay=trigger/track.Speed, approaching=approaching, score=(attack.critical and 100 or 0)+(position-trigger)/track.Speed*100-distance}
                         end
                     end
                 end
@@ -211,34 +521,244 @@ table.insert(state.connections, run.Heartbeat:Connect(function()
     local count = 0
     for _ in nearbyAttackers do count += 1 end
     state.threats = count
-    if #candidates == 0 or now < nextAction then return end
+    if preparationCandidate and canDefend then
+        if preparingUntil<=now then state.preparations+=1 end
+        preparingUntil=math.max(preparingUntil,now+preparationCandidate.untilGuard+0.06)
+        pauseAttack()
+        prepareGuardMovement()
+        if releaseAt==0 or preparationCandidate.critical then faceThreat(root,ownHum,preparationCandidate.target) end
+    end
+    if count>0 then
+        if data.InSafeZone~=true and data.Stance=='' and now>=nextStanceRequest then
+            nextStanceRequest=now+1
+            local ok=pcall(function() remote:FireServer('Stance') end)
+            if ok then state.stanceRequests+=1 end
+        end
+    end
+    if not canDefend then
+        preparingUntil=0
+        if releaseAt>0 then release() else restoreFacing() resumeAttack() end
+        return
+    end
+    if releaseAt==0 and now>=preparingUntil then resumeAttack() end
+    if #candidates == 0 or now < nextAction or releaseAt>now then return end
     table.sort(candidates, function(a,b) return a.score>b.score end)
     local chosen = candidates[1]
     if chosen.approaching then state.dashDetections += 1 end
     local running = ownHum.MoveDirection.Magnitude > 0.1 and root.AssemblyLinearVelocity.Magnitude > 8
     local attacking = tick < (data.M1LockUntil or 0) or tick < (data.M1CooldownUntil or 0) or data.ActionLock == true
-    local weave = not chosen.attack.critical and count == 1 and not running and not attacking and not pendingBlock and not data.IsBlocking and data.StanceHasWeave and tick >= (data.WeaveCooldownUntil or 0)
+    local weave = not chosen.attack.critical and not attacking and not pendingBlock and not data.IsBlocking and data.StanceHasWeave and tick >= (data.WeaveCooldownUntil or 0)
     state.running, state.attacking = running, attacking
     if facingTarget and facingTarget ~= chosen.target then state.targetSwitches += 1 end
     faceThreat(root, ownHum, chosen.target)
     state.turns += 1
     pauseAttack()
-    local ok, err = pcall(tryBlock, weave == true)
-    nextAction = now + 0.05
+    prepareGuardMovement()
+    currentRequest={attack=chosen.attack.name,critical=chosen.attack.critical,serverTime=tick,oldWeaveWindow=data.WeaveWindow or 0,oldWeaveState=data.WeaveState or 0,hardStop=now+0.32,guardAccepted=false,weaveAccepted=false,running=running,locked=data.ActionLock==true,stunned=serverStunUntil('FullStun',data)>tick or serverStunUntil('HardStun',data)>tick,softStun=serverStunUntil('SoftStun',data)>tick,stance=data.Stance,position=chosen.position}
+    state.stats.requests+=1
+    if chosen.attack.critical then state.stats.criticalRequests+=1 end
+    if running then state.stats.runningRequests+=1 end
+    acknowledged=false
+    state.recentActions[#state.recentActions+1]=currentRequest
+    if #state.recentActions>12 then table.remove(state.recentActions,1) end
+    local ok, err = pcall(nativePress,nil,nil,nil)
+    local combat=registry:get('ControlTable').Combat
+    local pulseTime=math.max(chosen.attack.critical and state.heavyGuardTime or state.normalGuardTime,combat.WeaveInvuln or 0.25)
+    nextAction = now + math.max(pulseTime+state.guardGap,combat.BlockCooldown or 0.175)
     if not ok then state.errors += 1 state.lastError = tostring(err) restoreFacing() resumeAttack() return end
     seen[chosen.track] = {position=chosen.position}
     state.attempts += 1
     if weave then state.weaves += 1 else state.blocks += 1 end
     state.lastAttack, state.lastTriggerPosition = chosen.attack.name, chosen.position
-    state.lastMode, state.lastTarget = weave and 'Weave' or 'Block', chosen.target.Parent.Name
-    releaseAt = math.max(releaseAt, now + (chosen.attack.critical and 0.90 or (weave and 0.14 or 0.35)))
+    state.lastDelay=chosen.delay
+    state.lastMode, state.lastTarget = chosen.attack.critical and 'Native critical guard' or 'Native guard', chosen.target.Parent.Name
+    releaseAt = now + pulseTime
     if not weave then
         if not pendingBlock then acknowledged = false end
         pendingBlock = true
         nextBlockSend = now + 0.05
-        state.recentBlocks[#state.recentBlocks+1] = {attack=chosen.attack.name,position=chosen.position,acknowledged=data.IsBlocking==true,stunned=(data.FullStun or 0)>tick or (data.SoftStun or 0)>tick,actionLock=data.ActionLock,health=ownHum.Health,running=running,attacking=attacking,threats=count,approaching=chosen.approaching}
+        state.recentBlocks[#state.recentBlocks+1] = {attack=chosen.attack.name,position=chosen.position,acknowledged=data.IsBlocking==true,stunned=(data.FullStun or 0)>tick or (data.SoftStun or 0)>tick,actionLock=data.ActionLock,health=ownHum.Health,running=running,attacking=attacking,threats=count,approaching=chosen.approaching,stance=data.Stance}
         if #state.recentBlocks>8 then table.remove(state.recentBlocks,1) end
     end
+    pendingBlock=true
     refresh()
+end
+state.avgUpdateMs,state.maxUpdateMs,state.runtimeErrors=0,0,0
+local stunKeys={'FullStun','HardStun','SoftStun','GoalWalkSpeed','OverrideWalkSpeed','JumpLockAfter','OverrideJumpPower'}
+clearAntiStun=function()
+    if not antiSource then return end
+    for _,c in antiSource.connections do c:Disconnect() end
+    for key in antiSource.dirty do antiSource.replica.Data[key]=antiSource.values[key] end
+    antiSource=nil
+end
+local function updateAntiStun(current)
+    if not current or type(current.Data)~='table' then clearAntiStun() return end
+    if not antiSource or antiSource.replica~=current then
+        clearAntiStun()
+        local source={replica=current,values={},connections={},dirty={}}
+        antiSource=source
+        local watched={}
+        for _,key in stunKeys do
+            watched[key]=true
+            source.values[key]=current.Data[key]
+        end
+        source.connections[1]=current:ListenToRaw(function(method,path,value)
+            if method=='SetValue' and #path==1 and watched[path[1]] then source.values[path[1]]=value
+            elseif method=='SetValues' and #path==0 and type(value)=='table' then
+                for key,v in value do if watched[key] then source.values[key]=v end end
+            end
+        end)
+    end
+    local source=antiSource
+    local d=current.Data
+    local tick=getTick()
+    local stunned=math.max(source.values.FullStun or 0,source.values.HardStun or 0,source.values.SoftStun or 0)>tick
+    state.serverStunned=stunned
+    local character=player.Character
+    local humanoid=character and character:FindFirstChildOfClass('Humanoid')
+    local active=state.antiStun and stunned and humanoid and humanoid.Health>0 and not d.Downed and (d.Ragdoll or 0)<=tick
+    if active then
+        for _,key in {'FullStun','HardStun','SoftStun','JumpLockAfter'} do d[key]=0 source.dirty[key]=true end
+        if not d.IsBlocking then
+            d.GoalWalkSpeed=math.max(source.values.GoalWalkSpeed or 0,d.WalkSpeed or 7)
+            source.dirty.GoalWalkSpeed=true
+            if source.values.OverrideWalkSpeed==0 then d.OverrideWalkSpeed=-1 source.dirty.OverrideWalkSpeed=true end
+            if source.values.OverrideJumpPower==0 then d.OverrideJumpPower=-1 source.dirty.OverrideJumpPower=true end
+        end
+        state.antiStunFrames+=1
+    else
+        for key in source.dirty do d[key]=source.values[key] end
+        table.clear(source.dirty)
+    end
+end
+local nextMovementUpdate=0
+table.insert(state.connections,run.PreSimulation:Connect(function()
+    updateAntiStun(registry:get('player-state-replica'))
+    local getter=registry:get('GetLocalStamina')
+    if state.infiniteStamina and type(getter)=='function' and type(debug.getupvalue(getter,1))=='number' then
+        debug.setupvalue(getter,1,1)
+        state.staminaWrites+=1
+    end
+    local now=os.clock()
+    if now<nextMovementUpdate then return end
+    nextMovementUpdate=now+0.10
+    if not tryRun then return end
+    runState=debug.getupvalue(tryRun,7)
+    runSignals=debug.getupvalue(tryRun,8)
+    if type(runState)~='table' then return end
+    local character=player.Character
+    local humanoid=character and character:FindFirstChildOfClass('Humanoid')
+    local latest=registry:get('player-state-replica')
+    local d=latest and latest.Data
+    if not humanoid or not d then return end
+    local moving=humanoid.MoveDirection.Magnitude>0.1 and humanoid.Health>0
+    if not state.autoSprint or not moving then
+        if autoStartedRun and runState.IsRunning and type(runSignals)=='table' and runSignals.OnRunChanged then
+            runState.IsRunning=false
+            runSignals.OnRunChanged:Fire(false)
+        end
+        autoStartedRun=false
+        return
+    end
+    if releaseAt>now or preparingUntil>now or d.IsBlocking or d.ActionLock then return end
+    local tick=getTick()
+    if (d.FullStun or 0)>tick or (d.HardStun or 0)>tick then return end
+    if not runState.IsRunning then
+        local ok=pcall(tryRun)
+        if ok and runState.IsRunning then autoStartedRun=true state.sprintStarts+=1 end
+    end
+end))
+table.insert(state.connections,run.Heartbeat:Connect(function()
+    local started=os.clock()
+    local ok,err=pcall(updateDefense)
+    local elapsed=(os.clock()-started)*1000
+    state.avgUpdateMs=state.avgUpdateMs*0.95+elapsed*0.05
+    state.maxUpdateMs=math.max(state.maxUpdateMs,elapsed)
+    if not ok then
+        state.runtimeErrors+=1
+        state.lastError=tostring(err)
+        state.enabled=false
+        pcall(release)
+        refresh()
+    end
 end))
 refresh()
+
+-- Player ESP: red fill, white outline, name / distance / health.
+state.esp, state.espEnabled = {}, true
+local players = game:GetService('Players')
+local function removeESP(other)
+    local entry=state.esp[other]
+    if entry then
+        entry.highlight:Destroy()
+        entry.billboard:Destroy()
+        state.esp[other]=nil
+    end
+end
+local function addCharacterESP(other,character)
+    if other==player then return end
+    removeESP(other)
+    local highlight=Instance.new('Highlight')
+    highlight.Name='IshinDefenseESP'
+    highlight.Adornee=character
+    highlight.FillColor=Color3.fromRGB(255,35,35)
+    highlight.OutlineColor=Color3.new(1,1,1)
+    highlight.FillTransparency=0.35
+    highlight.OutlineTransparency=0
+    highlight.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.Parent=gui
+    local billboard=Instance.new('BillboardGui')
+    billboard.Name='IshinDefenseESPLabel'
+    billboard.Size=UDim2.fromOffset(300,66)
+    billboard.StudsOffset=Vector3.new(0,2.7,0)
+    billboard.AlwaysOnTop=true
+    billboard.Parent=gui
+    local label=Instance.new('TextLabel')
+    label.Size=UDim2.fromScale(1,1)
+    label.BackgroundTransparency=1
+    label.TextColor3=Color3.new(1,1,1)
+    label.TextStrokeColor3=Color3.new(0,0,0)
+    label.TextStrokeTransparency=0.15
+    label.Font=Enum.Font.GothamBold
+    label.TextSize=20
+    label.Text=''
+    label.Parent=billboard
+    state.esp[other]={character=character,highlight=highlight,billboard=billboard,label=label}
+end
+local function watchPlayer(other)
+    if other==player then return end
+    local connections={}
+    state.playerConnections[other]=connections
+    connections[1]=other.CharacterAdded:Connect(function(character) addCharacterESP(other,character) end)
+    connections[2]=other.CharacterRemoving:Connect(function(character)
+        local entry=state.esp[other]
+        if entry and entry.character==character then removeESP(other) end
+    end)
+    if other.Character then addCharacterESP(other,other.Character) end
+end
+table.insert(state.connections,players.PlayerAdded:Connect(watchPlayer))
+table.insert(state.connections,players.PlayerRemoving:Connect(function(other)
+    removeESP(other)
+    for _,c in state.playerConnections[other] or {} do c:Disconnect() end
+    state.playerConnections[other]=nil
+end))
+for _,other in players:GetPlayers() do watchPlayer(other) end
+local nextESPUpdate=0
+table.insert(state.connections,run.Heartbeat:Connect(function()
+    if os.clock()<nextESPUpdate then return end
+    nextESPUpdate=os.clock()+0.15
+    local ownRoot=player.Character and player.Character:FindFirstChild('HumanoidRootPart')
+    for other,entry in state.esp do
+        local character=entry.character
+        local root=character:FindFirstChild('HumanoidRootPart')
+        local head=character:FindFirstChild('Head')
+        local humanoid=character:FindFirstChildOfClass('Humanoid')
+        local visible=state.espEnabled and character.Parent~=nil
+        entry.highlight.Enabled=visible
+        entry.billboard.Enabled=visible and root~=nil
+        entry.billboard.Adornee=head or root
+        local distance=ownRoot and root and string.format('%.0f m',(ownRoot.Position-root.Position).Magnitude*0.28) or '-- m'
+        local health=humanoid and string.format('HP %.0f/%.0f',math.max(0,humanoid.Health),humanoid.MaxHealth) or 'HP --'
+        entry.label.Text=string.format('%s\n%s | %s',other.Name,distance,health)
+    end
+end))
